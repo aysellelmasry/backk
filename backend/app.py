@@ -1,178 +1,186 @@
-import os
-import io
-import json
-import pickle
-import numpy as np
+import os, io, json, pickle, requests, numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import face_recognition
 from PIL import Image, ImageOps
 import logging
 
-# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────
 class Config:
-    # Paths — resolve relative to this file so the app works from any CWD
-    BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
-    DATA_DIR            = os.getenv('DATA_DIR', BASE_DIR)
-    ENCODINGS_FILE      = os.path.join(DATA_DIR, os.getenv('ENCODINGS_FILE',  'face_encodings.pkl'))
-    METADATA_FILE       = os.path.join(DATA_DIR, os.getenv('METADATA_FILE',   'photos_metadata.pkl'))
-    GDRIVE_MAPPING_FILE = os.path.join(DATA_DIR, os.getenv('GDRIVE_FILE',     'gdrive_file_mapping.json'))
+    # ── Google Drive File IDs (set these as environment variables in Render) ──
+    GDRIVE_ENCODINGS_ID = os.getenv('GDRIVE_ENCODINGS_ID', '1cuvndmsrehLX6uZK8C30U1AlQ82HY2oG')
+    GDRIVE_METADATA_ID  = os.getenv('GDRIVE_METADATA_ID',  '17O01aMqPGO0xO5A8G7qjOSrQv3ZxMu08')
+    GDRIVE_MAPPING_ID   = os.getenv('GDRIVE_MAPPING_ID',   '17WUEwVKK5oydc6VRV4HJXV1KZ0q0cYGf')
 
-    TOLERANCE      = float(os.getenv('TOLERANCE',    '0.52'))
-    MAX_UPLOAD_MB  = int(os.getenv('MAX_UPLOAD_MB',  '16'))
-    PORT           = int(os.getenv('PORT',           '5000'))
+    TOLERANCE     = float(os.getenv('TOLERANCE', '0.52'))
+    MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', '16'))
 
-    # Allowed origins — comma-separated list or * for all
-    # Example: ALLOWED_ORIGINS=https://myapp.vercel.app,https://myapp2.netlify.app
-    ALLOWED_ORIGINS = [o.strip() for o in os.getenv('ALLOWED_ORIGINS', '*').split(',') if o.strip()]
+    # Set FRONTEND_URL in Render to your Vercel URL, e.g. https://my-app.vercel.app
+    # Use '*' only for local dev — never in production (breaks credentialed requests)
+    FRONTEND_URL  = os.getenv('FRONTEND_URL', '*')
 
-    GDRIVE_DIRECT = "https://drive.google.com/uc?export=view&id={}"
-    GDRIVE_THUMB  = "https://drive.google.com/thumbnail?id={}&sz=w500"
+    # Google Drive URL templates
+    GDRIVE_DOWNLOAD = "https://drive.google.com/uc?export=download&id={}&confirm=t"
+    GDRIVE_DIRECT   = "https://drive.google.com/uc?export=view&id={}"
+    GDRIVE_THUMB    = "https://drive.google.com/thumbnail?id={}&sz=w500"
 
-# ── App setup ─────────────────────────────────────────────────────────────
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_UPLOAD_MB * 1024 * 1024
 
-origins = Config.ALLOWED_ORIGINS if Config.ALLOWED_ORIGINS != ['*'] else '*'
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Allow both wildcard (local dev) and a specific origin (production).
+# When FRONTEND_URL is '*', we allow all origins.
+# When it's a real URL, only that origin is allowed.
+origins = Config.FRONTEND_URL if Config.FRONTEND_URL == '*' else [Config.FRONTEND_URL]
 CORS(app,
      resources={r"/*": {"origins": origins}},
-     allow_headers=["Content-Type", "Authorization"],
+     allow_headers=["Content-Type"],
      methods=["GET", "POST", "OPTIONS"],
-     supports_credentials=False)
-logger.info(f"CORS origins: {origins}")
+     supports_credentials=False)   # credentials not needed; set True only if you add auth
 
-# ── Data cache ────────────────────────────────────────────────────────────
+# ── In-memory cache (lives for the lifetime of this Render worker) ────────────
 _data_cache = None
+
+
+def download_from_drive(file_id: str) -> bytes:
+    """Download any file from Google Drive by its file ID."""
+    url = Config.GDRIVE_DOWNLOAD.format(file_id)
+    logger.info(f"Downloading GDrive file: {file_id}")
+    session = requests.Session()
+    r = session.get(url, stream=True, timeout=180)
+    r.raise_for_status()
+
+    # Handle Google's virus-scan confirmation page for large files
+    if 'text/html' in r.headers.get('Content-Type', ''):
+        # Re-request with the confirm token if present
+        for key, val in r.cookies.items():
+            if key.startswith('download_warning'):
+                confirm_url = url + f"&confirm={val}"
+                r = session.get(confirm_url, stream=True, timeout=180)
+                r.raise_for_status()
+                break
+
+    buf = io.BytesIO()
+    for chunk in r.iter_content(chunk_size=8192):
+        buf.write(chunk)
+    return buf.getvalue()
+
 
 def load_data():
     global _data_cache
     if _data_cache is not None:
         return _data_cache
 
-    logger.info("Loading face database…")
+    logger.info("Loading face database from Google Drive…")
 
-    # Face encodings
+    # 1) Face encodings
     try:
-        with open(Config.ENCODINGS_FILE, 'rb') as f:
-            db = pickle.load(f)
-        logger.info(f"  {len(db)} encoding records loaded")
-    except FileNotFoundError:
-        logger.error(f"MISSING: {Config.ENCODINGS_FILE}")
-        db = {}
+        raw = download_from_drive(Config.GDRIVE_ENCODINGS_ID)
+        db = pickle.loads(raw)
+        logger.info(f"Loaded {len(db)} face records from encodings")
     except Exception as e:
-        logger.error(f"Encodings load error: {e}")
+        logger.error(f"Failed to load encodings: {e}")
         db = {}
 
-    # Photo metadata
+    # 2) Photo metadata
     try:
-        with open(Config.METADATA_FILE, 'rb') as f:
-            meta = pickle.load(f)
-        logger.info(f"  {len(meta)} metadata records loaded")
-    except FileNotFoundError:
-        logger.error(f"MISSING: {Config.METADATA_FILE}")
-        meta = {}
+        raw = download_from_drive(Config.GDRIVE_METADATA_ID)
+        meta = pickle.loads(raw)
+        logger.info(f"Loaded {len(meta)} metadata records")
     except Exception as e:
-        logger.error(f"Metadata load error: {e}")
+        logger.error(f"Failed to load metadata: {e}")
         meta = {}
 
-    # Google Drive file-ID mapping
+    # 3) GDrive filename→file_id mapping
     try:
-        with open(Config.GDRIVE_MAPPING_FILE, 'r') as f:
-            gdrive = json.load(f)
-        logger.info(f"  {len(gdrive)} GDrive mappings loaded")
-    except FileNotFoundError:
-        logger.error(f"MISSING: {Config.GDRIVE_MAPPING_FILE}")
-        gdrive = {}
+        raw = download_from_drive(Config.GDRIVE_MAPPING_ID)
+        gdrive = json.loads(raw.decode('utf-8'))
+        logger.info(f"Loaded {len(gdrive)} GDrive filename mappings")
     except Exception as e:
-        logger.error(f"GDrive map load error: {e}")
+        logger.error(f"Failed to load GDrive mapping: {e}")
         gdrive = {}
 
-    # Build encoding matrix
-    ids, enc_list = [], []
+    # 4) Build a flat numpy matrix for fast distance computation
+    ids, enc_matrix = [], []
     for photo_id, data in db.items():
+        # Support both old format (bare ndarray) and new format (dict with 'encodings' list)
         if isinstance(data, np.ndarray) and data.shape == (128,):
-            # Flat single encoding
             ids.append(photo_id)
-            enc_list.append(data)
-        else:
+            enc_matrix.append(data)
+        elif isinstance(data, dict):
             for enc in data.get('encodings', []):
                 ids.append(photo_id)
-                enc_list.append(enc)
+                enc_matrix.append(enc)
 
-    if enc_list:
-        enc_array = np.array(enc_list, dtype=np.float64)
-        logger.info(f"  Encoding matrix: {enc_array.shape}")
-    else:
-        enc_array = np.empty((0, 128), dtype=np.float64)
-        logger.warning("  Encoding matrix is EMPTY — run your indexing script first!")
+    enc_array = (np.array(enc_matrix, dtype=np.float64)
+                 if enc_matrix else np.empty((0, 128), dtype=np.float64))
+    logger.info(f"Encoding matrix shape: {enc_array.shape}")
 
     _data_cache = (db, meta, gdrive, ids, enc_array)
     return _data_cache
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+
 def encode_uploaded_images(files):
+    """Return a list of 128-d face encodings from the uploaded file objects."""
     encodings = []
     for file in files:
         if not file or file.filename == '':
             continue
         try:
             img = Image.open(file.stream)
-            img = ImageOps.exif_transpose(img)
-            img = img.convert('RGB')
+            img = ImageOps.exif_transpose(img).convert('RGB')
             img.thumbnail((1200, 1200), Image.LANCZOS)
             arr = np.array(img)
             found = face_recognition.face_encodings(arr, num_jitters=3, model='large')
             if found:
                 encodings.append(found[0])
-                logger.info(f"  Face encoded from {file.filename}")
             else:
-                logger.warning(f"  No face in {file.filename}")
+                logger.warning(f"No face detected in {file.filename}")
         except Exception as e:
             logger.error(f"Error processing {file.filename}: {e}")
     return encodings
 
-def get_gdrive_urls(filename, gdrive_map):
-    file_id = gdrive_map.get(filename)
-    if not file_id:
-        file_id = gdrive_map.get(os.path.splitext(filename)[0])
+
+def get_gdrive_urls(filename: str, gdrive_map: dict):
+    """Return (full_url, thumb_url) for a filename, or (None, None) if not mapped."""
+    # Try exact filename, then without extension
+    file_id = gdrive_map.get(filename) or gdrive_map.get(os.path.splitext(filename)[0])
     if not file_id:
         return None, None
-    return (
-        Config.GDRIVE_DIRECT.format(file_id),
-        Config.GDRIVE_THUMB.format(file_id),
-    )
+    return Config.GDRIVE_DIRECT.format(file_id), Config.GDRIVE_THUMB.format(file_id)
 
-# ── CORS preflight catch-all ──────────────────────────────────────────────
+
+# ── CORS preflight handled by flask-cors; this is a safety net ───────────────
 @app.after_request
 def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin']  = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    origin = request.headers.get('Origin', '')
+    if Config.FRONTEND_URL == '*' or origin == Config.FRONTEND_URL:
+        response.headers['Access-Control-Allow-Origin']  = Config.FRONTEND_URL
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
-# ── Routes ────────────────────────────────────────────────────────────────
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"status": "Graduation Photo Search API", "version": "1.0"})
+    return jsonify({"message": "Graduation Face Search API", "version": "1.0"})
 
-@app.route('/health', methods=['GET', 'OPTIONS'])
+
+@app.route('/health', methods=['GET'])
 def health():
     db, meta, gdrive, ids, enc_array = load_data()
-    missing = [f for f in [Config.ENCODINGS_FILE, Config.METADATA_FILE, Config.GDRIVE_MAPPING_FILE]
-               if not os.path.exists(f)]
     return jsonify({
-        "status":        "healthy",
-        "total_photos":  len(meta),
-        "total_faces":   len(enc_array),
+        "status": "healthy",
+        "total_photos": len(meta),
+        "total_faces": len(enc_array),
         "gdrive_mapped": len(gdrive),
-        "tolerance":     Config.TOLERANCE,
-        "missing_files": missing,
-        "db_records":    len(db),
     })
+
 
 @app.route('/search-face', methods=['POST', 'OPTIONS'])
 def search_face():
@@ -181,31 +189,25 @@ def search_face():
 
     files = request.files.getlist('face_image')
     if not files or all(f.filename == '' for f in files):
-        return jsonify({'error': 'No images uploaded. Use field name "face_image".'}), 400
+        return jsonify({'error': 'No images uploaded. The field name must be "face_image".'}), 400
 
     query_encodings = encode_uploaded_images(files)
     if not query_encodings:
-        return jsonify({
-            'error': (
-                'No face detected in your uploaded photo(s). '
-                'Please use a clear, well-lit, front-facing photo.'
-            )
-        }), 400
+        return jsonify({'error': 'No face detected in your photo(s). '
+                                 'Use a clear, well-lit, front-facing photo.'}), 400
 
+    # Average multiple reference encodings into one query vector
     query_enc = np.mean(query_encodings, axis=0)
 
     db, meta, gdrive, ids, enc_array = load_data()
+
     if len(enc_array) == 0:
-        return jsonify({
-            'success': True, 'matches': [], 'total_found': 0,
-            'warning': 'Face database is empty. Run your indexing script first.'
-        })
+        return jsonify({'success': True, 'matches': [], 'total_found': 0,
+                        'warning': 'Face database is empty.'})
 
     distances = face_recognition.face_distance(enc_array, query_enc)
-    logger.info(f"Distances — min:{distances.min():.3f} max:{distances.max():.3f} "
-                f"hits:{(distances < Config.TOLERANCE).sum()}")
 
-    # Best distance per photo
+    # Keep only the best (smallest) distance per photo
     best = {}
     for photo_id, dist in zip(ids, distances):
         if photo_id not in best or dist < best[photo_id]:
@@ -215,7 +217,7 @@ def search_face():
     for photo_id, dist in best.items():
         if dist >= Config.TOLERANCE:
             continue
-        info     = meta.get(photo_id, {})
+        info = meta.get(photo_id, {})
         filename = info.get('filename', f"{photo_id}.jpg")
         full_url, thumb_url = get_gdrive_urls(filename, gdrive)
         if not full_url:
@@ -230,24 +232,24 @@ def search_face():
         })
 
     matches.sort(key=lambda x: x['confidence'], reverse=True)
-    logger.info(f"Done: {len(matches)} matches, {skipped} skipped (no GDrive)")
-
     return jsonify({
-        'success':           True,
-        'matches':           matches,
-        'total_found':       len(matches),
+        'success':          True,
+        'matches':          matches,
+        'total_found':      len(matches),
         'skipped_no_gdrive': skipped,
     })
 
+
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({'error': f'File too large. Max {Config.MAX_UPLOAD_MB} MB per upload.'}), 413
+    return jsonify({'error': f'File too large. Max size is {Config.MAX_UPLOAD_MB} MB.'}), 413
 
 @app.errorhandler(500)
 def server_error(e):
-    logger.error(f"500: {e}")
-    return jsonify({'error': 'Internal server error. Please try again.'}), 500
+    return jsonify({'error': 'Internal server error.', 'detail': str(e)}), 500
+
 
 if __name__ == '__main__':
-    load_data()
-    app.run(host='0.0.0.0', port=Config.PORT, debug=os.getenv('FLASK_DEBUG', '').lower() == 'true')
+    load_data()   # warm up the cache before accepting requests
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
