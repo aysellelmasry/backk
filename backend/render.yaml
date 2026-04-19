@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: graduation-photo-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: TOLERANCE
+        value: "0.52"
+      - key: MAX_UPLOAD_MB
+        value: "16"
+      # Set ALLOWED_ORIGINS to your frontend URL after deployment:
+      # - key: ALLOWED_ORIGINS
+      #   value: "https://your-frontend.vercel.app"
