@@ -89,13 +89,20 @@ def load_data():
     return _data_cache
 
 
+# ── CHANGE 1: Read uploaded file into memory first before any processing ──────
+# Previously, file.stream was passed directly to PIL while still being read
+# from the socket. If the Gunicorn worker timed out mid-upload, this caused
+# a hard crash (SystemExit: 1) and killed the worker. Now we fully buffer
+# the upload into memory first, so socket reading is done before PIL touches it.
 def encode_uploaded_images(files):
     encodings = []
     for file in files:
         if not file or file.filename == '':
             continue
         try:
-            img = Image.open(file.stream)
+            # CHANGED: read entire file into a BytesIO buffer before processing
+            raw = io.BytesIO(file.read())
+            img = Image.open(raw)
             img = ImageOps.exif_transpose(img).convert('RGB')
             img.thumbnail((1200, 1200), Image.LANCZOS)
             arr = np.array(img)
@@ -140,10 +147,19 @@ def health():
     })
 
 
+# ── CHANGE 2: Eagerly buffer ALL uploaded files before doing any work ─────────
+# request.files.getlist() previously triggered lazy multipart parsing, meaning
+# the socket was still being read when face recognition started. Now we call
+# request.get_data() first to force Flask/Werkzeug to fully buffer the entire
+# request body before we touch request.files. This prevents the Gunicorn sync
+# worker from being killed mid-read by a timeout signal.
 @app.route('/search-face', methods=['POST', 'OPTIONS'])
 def search_face():
     if request.method == 'OPTIONS':
         return '', 204
+
+    # CHANGED: force full request buffering before accessing files
+    request.get_data()
 
     files = request.files.getlist('face_image')
     if not files or all(f.filename == '' for f in files):
