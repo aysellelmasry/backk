@@ -6,3 +6,6 @@ numpy==1.26.4
 requests==2.32.3
 gunicorn==22.0.0
 dlib==19.24.4
+gevent==24.2.1
+
+ 
